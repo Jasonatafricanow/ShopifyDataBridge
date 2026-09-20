@@ -1,0 +1,6 @@
+@reference "tailwindcss";
+
+/* Admin-specific styles */
+.admin-card {
+  @apply bg-white rounded-xl border border-gray-100 shadow-sm;
+}
