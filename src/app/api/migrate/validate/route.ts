@@ -8,6 +8,12 @@ export async function POST(request: NextRequest) {
     await requireUser(request);
     const body = await request.json();
     const { migration_id } = body as { migration_id?: string };
+    if (!migration_id) {
+      return NextResponse.json(
+        { error: "migration_id is required" },
+        { status: 400 },
+      );
+    }
 
     const result = await validateMigration(migration_id);
     return NextResponse.json(result);
