@@ -1,48 +1,80 @@
-# ShopifyDataBridge · 研发演进与设计基线
+# ShopifyDataBridge — Development and Boundary Record
 
-本文档记录 ShopifyDataBridge（前身为 MoveShopify）从早期全功能电商脚手架到专用轻量级数据迁移中继工具的演进过程与工程规范。
+This document records why the project became a narrow migration adapter. Current code,
+tests, CI and the TradingWEB receiver contract take precedence over older scaffold
+descriptions.
 
----
+## 1. Scope reduction
 
-## 1. 架构定位演进
+The project began from a broader commerce scaffold. Once TradingWEB became the system that
+owned products, customers, orders, transactions and business rules, maintaining another
+partially independent commerce system created duplicate authority.
 
-### 1.1 历史背景与重构动机
-项目早期包含前台店铺、结算、支付和后台管理。然而随着业务发展，交易核心能力集中由主站 `tradingWEB` 承载，两套电商系统并存导致维护成本激增、数据模型割裂。
-经过架构决策，本项目进行**业务解耦与边界收窄**：
-* 剥离全部独立前台、支付、优惠券及订单履约。
-* 聚焦作为 **Shopify -> TradingWEB 数据清洗与迁移中继专用工具**。
+The boundary was reduced to:
 
-### 1.2 迁移管道设计
+```text
+Shopify export
+  -> parse / sanitize / map source identity
+  -> TradingWEB import envelope
+  -> TradingWEB validation + idempotency + transaction
 ```
-Shopify CSV -> PapaParse -> Security Sanitization -> 6D Validation -> TradingWEB Receiver
-```
-* **异步分批导入**：大容量 CSV 采用前端流式切片与服务端分页写入，避免内存溢出。
-* **状态可观测性**：基于持久化存储的迁移进度轮询（`/api/admin/migration/progress`）与错误明细导出。
 
----
+DataBridge should not own target database tables or business transactions.
 
-## 2. 安全加固基线
+## 2. Audit correction: direct writes were removed
 
-1. **输入净化（Input Sanitization）**：
-   * CSV 单元格内容自动剔除 `@`, `+`, `-`, `=` 等潜在的 Excel/Calc 宏注入符号。
-   * HTML 富文本清洗（过滤 `<script>`, `<iframe>`, `javascript:` 伪协议）。
-2. **鉴权与防刷**：
-   * 所有 `/api/migrate/*` 路由强制要求 Bearer Token 校验。
-   * 浏览器端与管理面板交互附带 Authorization Header。
-3. **资源白名单**：
-   * 图片链接仅允许 Shopify 官方 CDN 域名（`cdn.shopify.com`），拦截外链爬虫与恶意探针。
+A later review found that the migration layer still had too much target-side authority.
+The repair:
 
----
+- routes product/customer/order migrations through the TradingWEB receiver;
+- removes direct target-database writes from the CSV pipeline;
+- removes service-role escalation for migration;
+- requires an explicit migration administrator allowlist;
+- reads migration/reconciliation state back from TradingWEB sessions;
+- adds tests that prevent direct target-database writes from returning.
 
-## 3. 测试与质量保证
+This is the current architecture. Historical descriptions of DataBridge as a standalone
+migration backend should not override it.
+
+## 3. Credential separation
+
+Two credentials have different purposes:
+
+- Supabase login establishes the UI operator identity, additionally constrained by
+  `MIGRATION_ADMIN_EMAILS`;
+- `TRADINGWEB_IMPORT_TOKEN` is server-side and authorizes the call to TradingWEB.
+
+The browser must not receive the TradingWEB import token.
+
+## 4. Source identity and retries
+
+Where Shopify exports provide stable source IDs, DataBridge preserves them in the import
+contract so TradingWEB can resolve references and treat retries through its
+`external_source_mappings` / import-session logic.
+
+## 5. Verification
+
+Current CI runs:
 
 ```bash
-# 运行类型检查
-pnpm ts-check
-
-# 运行代码检查
-pnpm lint
-
-# 运行单元测试
+pnpm install --frozen-lockfile
+pnpm validate
 pnpm test
 ```
+
+The current `package.json` still carries a wider frontend dependency surface inherited
+from the earlier scaffold. That is dependency/cleanup debt, not evidence that DataBridge
+owns those older commerce responsibilities. Dependencies should only be removed after
+checking the active UI/build paths rather than to make the manifest look artificially
+small.
+
+## 6. Current non-goals
+
+DataBridge is not:
+
+- a general ETL framework;
+- the target schema authority;
+- a second order/payment system;
+- an alternate TradingWEB database writer.
+
+TradingWEB owns final admission and business-state mutation.
