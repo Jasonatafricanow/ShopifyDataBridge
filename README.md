@@ -80,6 +80,27 @@ direct target writes and require explicit migration-administrator authorization.
 
 This correction is visible in `fix: route migrations through the TradingWEB receiver (#2)`.
 
+## Bounded completeness
+
+DataBridge is intentionally smaller after the architecture correction because target-side
+authority was removed from it.
+
+It owns:
+
+- Shopify CSV parsing and sanitization;
+- preservation/mapping of stable Shopify source identities;
+- creation/submission of TradingWEB import sessions/envelopes;
+- operator authentication at the migration UI boundary;
+- presentation of TradingWEB reconciliation results.
+
+TradingWEB owns target schema validation, reference resolution, idempotency, transactions
+and final database mutation. Re-implementing those responsibilities inside DataBridge
+would increase code size by recreating a second business authority—the failure mode the
+current architecture explicitly removed.
+
+The repository should therefore be evaluated on whether the sender contract is complete and
+whether tests prevent target-write authority from leaking back in.
+
 ## Verification
 
 ```bash
