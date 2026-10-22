@@ -128,6 +128,16 @@ function mapProduct(
     first["Product Category"] || first["Type"] || first["type"],
   );
 
+  // Additional Shopify image rows repeat the handle but contain no variant.
+  // Keep them for the gallery without creating a free, empty-SKU variant.
+  const variantRows = rows.filter((row) => [
+    "Variant ID", "variant_id", "Variant SKU", "Variant Price",
+    "Option1 Value", "Option2 Value", "Option3 Value",
+  ].some((key) => (row[key] || "").trim() !== ""));
+  if (variantRows.length === 0) {
+    throw new Error(`Product ${sourceId} has no variant data`);
+  }
+
   return {
     source_id: sourceId,
     title,
@@ -148,8 +158,8 @@ function mapProduct(
         ? "draft"
         : "active",
     images: mapImages(rows),
-    variants: rows.map((row, index) =>
-      mapVariant(row, sourceId, index, rows.length)
+    variants: variantRows.map((row, index) =>
+      mapVariant(row, sourceId, index, variantRows.length)
     ),
     legacy_paths: handle ? [`/products/${sanitizeText(handle)}`] : [],
     seo: {
