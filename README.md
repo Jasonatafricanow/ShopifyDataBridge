@@ -1,129 +1,41 @@
 # ShopifyDataBridge
 
-ShopifyDataBridge converts Shopify CSV exports into TradingWEB's import
-contract. It does not write TradingWEB database tables directly.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-## Runtime path
+Convert Shopify product, customer and order CSV exports into TradingWEB import sessions. TradingWEB validates and commits the destination records.
 
-```text
-Shopify CSV
-  -> parse / sanitize
-  -> map stable Shopify source IDs
-  -> create TradingWEB import session
-  -> POST standard import envelope
-  -> TradingWEB validation / idempotent receiver / transaction
-  -> TradingWEB database
-```
+## Import flow
 
-Products, variants, customers, orders, addresses and line items keep their
-Shopify IDs as source identities whenever the export provides them. TradingWEB
-uses those identities in `external_source_mappings` for retries and reference
-resolution.
+CSV → parse and sanitize → map source IDs → submit import envelope → read the TradingWEB reconciliation result.
 
-## Authentication
-
-There are two separate credentials.
-
-DataBridge uses Supabase only to verify the person opening the migration UI.
-A valid Supabase account is not enough: the account email must also appear in
-`MIGRATION_ADMIN_EMAILS`.
-
-TradingWEB writes use a server-side bearer credential from
-`TRADINGWEB_IMPORT_TOKEN`. The browser never receives this token.
-
-Required environment:
+Supabase authenticates operators; `MIGRATION_ADMIN_EMAILS` authorizes them. Only the server uses `TRADINGWEB_IMPORT_TOKEN`.
 
 ```env
-# DataBridge login identity only
-COZE_SUPABASE_URL=https://...
-COZE_SUPABASE_ANON_KEY=...
-MIGRATION_ADMIN_EMAILS=admin@example.com,operator@example.com
-
-# TradingWEB import receiver
-TRADINGWEB_API_URL=https://fjglobal.online/api
-TRADINGWEB_IMPORT_TOKEN=<active TradingWEB admin/operator bearer token>
-SHOPIFY_SOURCE_STORE=my-shop.myshopify.com
+COZE_SUPABASE_URL=https://your-project.supabase.co
+COZE_SUPABASE_ANON_KEY=<public-anon-key>
+MIGRATION_ADMIN_EMAILS=admin@example.com
+TRADINGWEB_API_URL=https://store.example.com/api
+TRADINGWEB_IMPORT_TOKEN=<server-side-operator-token>
+SHOPIFY_SOURCE_STORE=example.myshopify.com
 ```
 
-DataBridge does not use a Supabase service-role key for migration.
-
-## Imports
-
-Supported sender paths:
-
-- products + variants + images + inventory quantity;
-- customers + addresses;
-- historical orders + line items.
-
-Order imports depend on the same `SHOPIFY_SOURCE_STORE` namespace used for the
-earlier product/customer imports so TradingWEB can resolve source mappings.
-
-Migration logs and reconciliation are read back from TradingWEB import
-sessions. `migration_id` in the DataBridge UI is the TradingWEB
-`session_id`.
-
-## Validation
-
-TradingWEB owns target-side validation. DataBridge performs CSV parsing and
-input sanitization before submission; TradingWEB validates the envelope,
-references and target constraints before accepting records.
-
-After an import, DataBridge reads the TradingWEB session reconciliation result
-rather than querying a second copy of the target database.
-
-## Architecture correction
-
-The first public version still carried a more direct migration shape. A later audit moved
-target writes behind TradingWEB's import receiver and removed DataBridge's service-role
-escalation/direct target-database ownership. Regression tests now prevent reintroducing
-direct target writes and require explicit migration-administrator authorization.
-
-This correction is visible in `fix: route migrations through the TradingWEB receiver (#2)`.
-
-## Bounded completeness
-
-DataBridge is intentionally smaller after the architecture correction because target-side
-authority was removed from it.
-
-It owns:
-
-- Shopify CSV parsing and sanitization;
-- preservation/mapping of stable Shopify source identities;
-- creation/submission of TradingWEB import sessions/envelopes;
-- operator authentication at the migration UI boundary;
-- presentation of TradingWEB reconciliation results.
-
-TradingWEB owns target schema validation, reference resolution, idempotency, transactions
-and final database mutation. Re-implementing those responsibilities inside DataBridge
-would increase code size by recreating a second business authority—the failure mode the
-current architecture explicitly removed.
-
-The repository should therefore be evaluated on whether the sender contract is complete and
-whether tests prevent target-write authority from leaking back in.
-
-## Verification
+## Run and verify
 
 ```bash
 pnpm install --frozen-lockfile
+pnpm dev
 pnpm validate
 pnpm test
 ```
 
-CI runs the same TypeScript/lint/test gates on `main` and pull requests.
+Importer regression tests call the production parser and mappers with synthetic CSV fixtures; only the receiver transport is mocked. Real, anonymized merchant exports and live receiver reconciliation remain separate acceptance work.
 
-## Run
+## Details and limitations
 
-```bash
-pnpm install
-pnpm dev
-```
+[Implementation](docs/IMPLEMENTATION.md) · [architecture correction history](docs/AUDIT-HISTORY.md) · [tests](src/__tests__)
 
-## Scope
+The sender retains an in-process progress cache. Restart/resume, dry-run field differences and downloadable reconciliation reports remain follow-ups. `COZE_` names are retained for configuration compatibility.
 
-This is a Shopify-to-TradingWEB migration adapter, not a general ETL platform.
-TradingWEB remains the owner of target schemas, transactions, idempotency and
-business data.
+## License
 
-## Stack
-
-Next.js · React · TypeScript · PapaParse · Supabase Auth · Vitest
+MIT — see [LICENSE](LICENSE).
