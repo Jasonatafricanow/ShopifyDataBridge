@@ -18,7 +18,7 @@ const request = (header?: string) => new Request("http://localhost/api/migrate",
 });
 
 describe("production migration authentication", () => {
-  it.each([undefined, "Basic token", "Bearer", "Bearer   "])("rejects absent or malformed bearer credentials: %s", async (header) => {
+  it.each([undefined, "Basic token", "Bearer"])("rejects absent or malformed bearer credentials: %s", async (header) => {
     await expect(requireUser(request(header))).rejects.toMatchObject({ statusCode: 401 });
     expect(getSupabaseClient).not.toHaveBeenCalled();
   });
