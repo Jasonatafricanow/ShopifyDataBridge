@@ -78,7 +78,7 @@ export function errorResponse(err: unknown): Response {
       headers: { "Content-Type": "application/json" },
     });
   }
-  const message = err instanceof Error ? err.message : "Internal server error";
+  const message = "Internal server error";
   return new Response(JSON.stringify({ error: message }), {
     status: 500,
     headers: { "Content-Type": "application/json" },
