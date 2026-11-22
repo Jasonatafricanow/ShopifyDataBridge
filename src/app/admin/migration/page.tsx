@@ -86,6 +86,10 @@ export default function MigrationPage() {
   };
 
   const handleValidate = async () => {
+    if (!latestMigrationId) {
+      alert('请先完成至少一次迁移，再执行 TradingWEB reconciliation');
+      return;
+    }
     setValidating(true);
     try {
       const headers = authHeaders();
@@ -96,7 +100,7 @@ export default function MigrationPage() {
       const res = await fetch('/api/migrate/validate', {
         method: 'POST',
         headers: { ...headers, 'Content-Type': 'application/json' },
-        body: '{}',
+        body: JSON.stringify({ migration_id: latestMigrationId }),
       });
       const data = await res.json();
       if (data.error) {

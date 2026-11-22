@@ -1,4 +1,4 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 let envLoaded = false;
 
@@ -8,21 +8,19 @@ interface SupabaseCredentials {
 }
 
 function loadEnv(): void {
-  if (envLoaded || (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY)) {
+  if (
+    envLoaded
+    || (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY)
+  ) {
     return;
   }
 
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    require('dotenv').config();
-    if (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY) {
-      envLoaded = true;
-      return;
-    }
+    require("dotenv").config();
   } catch {
-    // dotenv not available
+    // dotenv is optional in managed runtimes
   }
-
   envLoaded = true;
 }
 
@@ -31,43 +29,22 @@ function getSupabaseCredentials(): SupabaseCredentials {
 
   const url = process.env.COZE_SUPABASE_URL;
   const anonKey = process.env.COZE_SUPABASE_ANON_KEY;
-
-  if (!url) {
-    throw new Error('COZE_SUPABASE_URL is not set');
-  }
-  if (!anonKey) {
-    throw new Error('COZE_SUPABASE_ANON_KEY is not set');
-  }
-
+  if (!url) throw new Error("COZE_SUPABASE_URL is not set");
+  if (!anonKey) throw new Error("COZE_SUPABASE_ANON_KEY is not set");
   return { url, anonKey };
 }
 
-function getSupabaseServiceRoleKey(): string | undefined {
-  loadEnv();
-  return process.env.COZE_SUPABASE_SERVICE_ROLE_KEY;
-}
-
+/**
+ * Supabase is an identity provider for DataBridge, not the migration target.
+ * This client never escalates to a service-role key.
+ */
 function getSupabaseClient(token?: string): SupabaseClient {
   const { url, anonKey } = getSupabaseCredentials();
-
-  let key: string;
-  if (token) {
-    key = anonKey;
-  } else {
-    const serviceRoleKey = getSupabaseServiceRoleKey();
-    key = serviceRoleKey ?? anonKey;
-  }
-
-  const globalOptions: Record<string, Record<string, string>> = {};
-  if (token) {
-    globalOptions.headers = { Authorization: `Bearer ${token}` };
-  }
-
-  return createClient(url, key, {
-    global: globalOptions,
-    db: {
-      timeout: 60000,
-    },
+  return createClient(url, anonKey, {
+    global: token
+      ? { headers: { Authorization: `Bearer ${token}` } }
+      : undefined,
+    db: { timeout: 60000 },
     auth: {
       autoRefreshToken: false,
       persistSession: false,
@@ -75,4 +52,8 @@ function getSupabaseClient(token?: string): SupabaseClient {
   });
 }
 
-export { loadEnv, getSupabaseCredentials, getSupabaseServiceRoleKey, getSupabaseClient };
+export {
+  loadEnv,
+  getSupabaseCredentials,
+  getSupabaseClient,
+};

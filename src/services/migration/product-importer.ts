@@ -1,142 +1,170 @@
-/**
- * 商品 CSV 导入逻辑
- *
- * Shopify 商品 CSV 每个变体占一行，按 Handle 分组后创建商品 + 变体 + 图片 + 库存。
- */
-import { v4 as uuidv4 } from 'uuid'
-import { getSupabaseClient } from '@/storage/database/supabase-client'
-import { importGroupedCsv, type ImportResult } from './csv-importer'
-import { generateSlug, ensureUniqueSlug } from '@/lib/migration-utils'
-import { sanitizeHtml, sanitizeText, sanitizeNullableText, isAllowedShopifyImageUrl } from '@/lib/security'
+import {
+  isAllowedShopifyImageUrl,
+  sanitizeHtml,
+  sanitizeNullableText,
+  sanitizeText,
+} from "@/lib/security";
+import {
+  finishProgress,
+  groupRows,
+  parseCsvRows,
+  setRunningProgress,
+  type ImportResult,
+} from "./csv-importer";
+import type {
+  ImportImage,
+  ImportProductRecord,
+  ImportProductVariant,
+} from "./contracts";
+import { importEnvelope } from "./tradingweb-client";
 
-interface ProductGroup {
-  rows: Record<string, string>[]
-  handle: string
+function productGroupKey(row: Record<string, string>): string {
+  return row["Handle"] || row["handle"] || row["ID"] || "";
 }
 
-function groupKey(row: Record<string, string>): string {
-  return row['Handle'] || row['handle'] || ''
+function splitTags(value: string): string[] {
+  return [...new Set(
+    sanitizeText(value || "")
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean),
+  )];
 }
 
-function mapGroup(rows: Record<string, string>[], handle: string): ProductGroup {
-  return { rows, handle }
+function stableProductSourceId(
+  first: Record<string, string>,
+  handle: string,
+): string {
+  return sanitizeText(first["ID"] || first["Product ID"] || handle);
 }
 
-async function writeProductGroup(
-  client: ReturnType<typeof getSupabaseClient>,
-  group: ProductGroup,
-) {
-  const { rows, handle } = group
-  const firstRow = rows[0]
+function variantSourceId(
+  row: Record<string, string>,
+  productSourceId: string,
+  index: number,
+): string {
+  return sanitizeText(
+    row["Variant ID"]
+      || row["variant_id"]
+      || row["Variant SKU"]
+      || `${productSourceId}:variant:${index}`,
+  );
+}
 
-  const title = sanitizeText(firstRow['Title'] || firstRow['title'] || handle)
-  const slug = await ensureUniqueSlug('products', generateSlug(title))
-  const productType = sanitizeText(firstRow['Type'] || firstRow['Product Category'] || firstRow['type'] || '')
-
-  // 查找或创建分类
-  let categoryId: string | null = null
-  if (productType) {
-    const { data: existingCat } = await client.from('categories').select('id').eq('name', productType).maybeSingle()
-    if (existingCat) {
-      categoryId = existingCat.id
-    } else {
-      const catSlug = await ensureUniqueSlug('categories', generateSlug(productType))
-      const { data: newCat, error: catError } = await client.from('categories').insert({
-        name: productType,
-        slug: catSlug,
-        shopify_id: sanitizeNullableText(firstRow['Custom collections']),
-      }).select().single()
-      if (!catError && newCat) categoryId = newCat.id
-    }
+function mapVariant(
+  row: Record<string, string>,
+  productSourceId: string,
+  index: number,
+  count: number,
+): ImportProductVariant {
+  const options: Record<string, string> = {};
+  for (const n of [1, 2, 3]) {
+    const name = sanitizeText(row[`Option${n} Name`] || "");
+    const value = sanitizeText(row[`Option${n} Value`] || "");
+    if (name && value) options[name] = value;
   }
 
-  // 使用 sanitizeHtml 清洗 Shopify HTML，防止存储型 XSS
-  const cleanHtml = sanitizeHtml(firstRow['Body (HTML)'] || firstRow['body_html'] || '')
+  const image = row["Variant Image"] || row["Image Src"] || "";
+  return {
+    source_id: variantSourceId(row, productSourceId, index),
+    sku: sanitizeNullableText(row["Variant SKU"]),
+    barcode: sanitizeNullableText(row["Variant Barcode"]),
+    title: sanitizeNullableText(
+      row["Variant Title"] || row["Title"] || undefined,
+    ),
+    options,
+    price: row["Variant Price"] || "0",
+    compare_at_price: sanitizeNullableText(row["Variant Compare At Price"]),
+    weight: row["Variant Grams"]
+      ? (Number(row["Variant Grams"]) / 1000).toString()
+      : null,
+    weight_unit: "kg",
+    image: image && isAllowedShopifyImageUrl(image) ? image : null,
+    is_default: count === 1 || index === 0,
+    inventory_quantity:
+      Number.parseInt(
+        row["Variant Inventory Qty"]
+          || row["variant_inventory_quantity"]
+          || "0",
+        10,
+      ) || 0,
+  };
+}
 
-  // 创建商品
-  const productId = uuidv4()
-  const { error: prodError } = await client.from('products').insert({
-    id: productId,
-    title,
-    slug,
-    description: cleanHtml,
-    body_html: cleanHtml,
-    vendor: sanitizeText(firstRow['Vendor'] || firstRow['vendor'] || ''),
-    product_type: productType,
-    category_id: categoryId,
-    status: (firstRow['Published'] === 'false' || firstRow['Status'] === 'draft') ? 'draft' : 'active',
-    tags: sanitizeText(firstRow['Tags'] || firstRow['tags'] || ''),
-    shopify_id: sanitizeText(firstRow['ID'] || ''),
-    shopify_handle: sanitizeText(handle),
-    published_at: firstRow['Published'] === 'true' ? new Date().toISOString() : null,
-  })
-  if (prodError) throw new Error(`创建商品失败: ${prodError.message}`)
-
-  // 创建变体、库存、图片
+function mapImages(rows: Record<string, string>[]): ImportImage[] {
+  const seen = new Set<string>();
+  const images: ImportImage[] = [];
   for (const row of rows) {
-    const variantSku = sanitizeNullableText(row['Variant SKU'])
-    const price = row['Variant Price'] || row['variant_price'] || '0'
-    const comparePrice = row['Variant Compare At Price'] || row['variant_compare_at_price'] || null
-    const inventory = parseInt(row['Variant Inventory Qty'] || row['variant_inventory_quantity'] || '0', 10) || 0
-
-    const variantId = uuidv4()
-    const { error: varError } = await client.from('product_variants').insert({
-      id: variantId,
-      product_id: productId,
-      title: sanitizeText(row['Title'] || row['variant_title'] || title),
-      sku: variantSku || null,
-      barcode: sanitizeNullableText(row['Variant Barcode']),
-      price,
-      compare_at_price: comparePrice,
-      weight: row['Variant Grams'] ? (parseFloat(row['Variant Grams']) / 1000).toString() : null,
-      weight_unit: 'kg',
-      inventory_quantity: inventory,
-      option1: sanitizeNullableText(row['Option1 Value'] || row['option1']),
-      option2: sanitizeNullableText(row['Option2 Value'] || row['option2']),
-      option3: sanitizeNullableText(row['Option3 Value'] || row['option3']),
-      position: parseInt(row['Variant Position'] || '1', 10) || 1,
-      is_default: rows.length === 1,
-      shopify_id: sanitizeText(row['Variant ID'] || ''),
-    })
-    if (varError) throw new Error(`创建变体失败: ${varError.message}`)
-
-    // 库存
-    await client.from('inventory_records').insert({
-      id: uuidv4(),
-      variant_id: variantId,
-      product_id: productId,
-      available: inventory,
-      on_hand: inventory,
-      committed: 0,
-      damaged: 0,
-      shopify_inventory_item_id: sanitizeNullableText(row['Variant Inventory Item ID']),
-    })
-
-    // 图片 — 必须通过 Shopify 域名白名单校验
-    const imgSrc = row['Image Src'] || row['image_src'] || ''
-    if (imgSrc && isAllowedShopifyImageUrl(imgSrc)) {
-      await client.from('product_images').insert({
-        id: uuidv4(),
-        product_id: productId,
-        variant_id: variantId,
-        src: imgSrc,
-        alt: sanitizeText(row['Image Alt Text'] || row['title'] || title),
-        position: parseInt(row['Image Position'] || '1', 10) || 1,
-        width: null,
-        height: null,
-        shopify_id: sanitizeNullableText(row['Image Id']),
-      })
-    }
+    const url = row["Image Src"] || row["image_src"] || "";
+    if (!url || seen.has(url) || !isAllowedShopifyImageUrl(url)) continue;
+    seen.add(url);
+    images.push({
+      url,
+      alt: sanitizeNullableText(
+        row["Image Alt Text"] || row["Title"] || undefined,
+      ),
+      position:
+        Number.parseInt(row["Image Position"] || "", 10)
+        || images.length + 1,
+    });
   }
+  return images;
 }
 
-/** 从 CSV 导入商品 */
+function mapProduct(
+  rows: Record<string, string>[],
+  handle: string,
+): ImportProductRecord {
+  const first = rows[0];
+  const sourceId = stableProductSourceId(first, handle);
+  if (!sourceId) {
+    throw new Error(`Product ${handle || "<unknown>"} has no stable source ID`);
+  }
+
+  const title = sanitizeText(first["Title"] || first["title"] || handle);
+  if (!title) throw new Error(`Product ${sourceId} has no title`);
+
+  const category = sanitizeNullableText(
+    first["Product Category"] || first["Type"] || first["type"],
+  );
+
+  return {
+    source_id: sourceId,
+    title,
+    description: sanitizeHtml(
+      first["Body (HTML)"] || first["body_html"] || "",
+    ),
+    vendor: sanitizeNullableText(first["Vendor"] || first["vendor"]),
+    collection: sanitizeNullableText(first["Custom collections"]),
+    barcode: sanitizeNullableText(first["Barcode"]),
+    compare_at_price: sanitizeNullableText(first["Variant Compare At Price"]),
+    // Shopify's "Type" is a merchandising category, not TradingWEB's
+    // physical/virtual/service product-kind field.
+    type: "physical",
+    category,
+    tags: splitTags(first["Tags"] || first["tags"] || ""),
+    status:
+      first["Published"] === "false" || first["Status"] === "draft"
+        ? "draft"
+        : "active",
+    images: mapImages(rows),
+    variants: rows.map((row, index) =>
+      mapVariant(row, sourceId, index, rows.length)
+    ),
+    legacy_paths: handle ? [`/products/${sanitizeText(handle)}`] : [],
+    seo: {
+      meta_title: sanitizeNullableText(first["SEO Title"]),
+      meta_description: sanitizeNullableText(first["SEO Description"]),
+    },
+  };
+}
+
 export async function importProducts(file: File): Promise<ImportResult> {
-  return importGroupedCsv(
-    file,
-    'products',
-    groupKey,
-    mapGroup,
-    writeProductGroup,
-  )
+  const rows = await parseCsvRows(file);
+  const groups = groupRows(rows, productGroupKey);
+  const records = groups.map(([handle, group]) => mapProduct(group, handle));
+
+  const { sessionId, result } = await importEnvelope("products", records);
+  setRunningProgress(sessionId, "products", records.length);
+  return finishProgress(sessionId, "products", result);
 }

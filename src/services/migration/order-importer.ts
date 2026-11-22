@@ -1,164 +1,157 @@
-/**
- * 订单 CSV 导入逻辑
- *
- * Shopify 订单 CSV 每个订单项占一行，需按 Order ID 分组后再处理。
- */
-import { v4 as uuidv4 } from 'uuid'
-import { getSupabaseClient } from '@/storage/database/supabase-client'
-import { importGroupedCsv, type ImportResult } from './csv-importer'
-import { sanitizeEmail, sanitizeNullableText, sanitizeText } from '@/lib/security'
+import {
+  sanitizeEmail,
+  sanitizeNullableText,
+  sanitizeText,
+} from "@/lib/security";
+import {
+  finishProgress,
+  groupRows,
+  parseCsvRows,
+  setRunningProgress,
+  type ImportResult,
+} from "./csv-importer";
+import type {
+  ImportAddress,
+  ImportOrderLineItem,
+  ImportOrderRecord,
+} from "./contracts";
+import { importEnvelope } from "./tradingweb-client";
 
-interface OrderGroup {
-  rows: Record<string, string>[]
-  orderId: string
+function orderGroupKey(row: Record<string, string>): string {
+  return row["Order ID"] || row["Name"] || row["order_id"] || row["name"] || "";
 }
 
-function groupKey(row: Record<string, string>): string {
-  return row['Order ID'] || row['Name'] || row['order_id'] || row['name'] || ''
+function cleanAddress(
+  row: Record<string, string>,
+  prefix: "Shipping" | "Billing",
+): ImportAddress | null {
+  const address1 = sanitizeNullableText(
+    row[`${prefix} Address1`]
+      || row[`${prefix.toLowerCase()}_address1`],
+  );
+  const city = sanitizeNullableText(
+    row[`${prefix} City`]
+      || row[`${prefix.toLowerCase()}_city`],
+  );
+  if (!address1 && !city) return null;
+
+  return {
+    first_name: sanitizeNullableText(row[`${prefix} First Name`]),
+    last_name: sanitizeNullableText(row[`${prefix} Last Name`]),
+    company: sanitizeNullableText(row[`${prefix} Company`]),
+    address1,
+    address2: sanitizeNullableText(row[`${prefix} Address2`]),
+    city,
+    province: sanitizeNullableText(
+      row[`${prefix} Province`]
+        || row[`${prefix.toLowerCase()}_province`],
+    ),
+    province_code: sanitizeNullableText(row[`${prefix} Province Code`]),
+    country: sanitizeNullableText(
+      row[`${prefix} Country`]
+        || row[`${prefix.toLowerCase()}_country`],
+    ),
+    country_code: sanitizeNullableText(row[`${prefix} Country Code`]),
+    zip: sanitizeNullableText(
+      row[`${prefix} Zip`]
+        || row[`${prefix.toLowerCase()}_zip`],
+    ),
+    phone: sanitizeNullableText(row[`${prefix} Phone`]),
+  };
 }
 
-function mapGroup(rows: Record<string, string>[], orderId: string): OrderGroup {
-  return { rows, orderId }
+function mapLineItem(
+  row: Record<string, string>,
+): ImportOrderLineItem {
+  return {
+    product_source_id: sanitizeNullableText(
+      row["Product ID"] || row["Lineitem product id"],
+    ),
+    variant_source_id: sanitizeNullableText(
+      row["Variant ID"] || row["Lineitem variant id"],
+    ),
+    title: sanitizeText(
+      row["Lineitem name"] || row["Title"] || row["title"] || "",
+    ),
+    sku: sanitizeNullableText(
+      row["Lineitem sku"] || row["SKU"] || row["sku"],
+    ),
+    quantity:
+      Number.parseInt(row["Lineitem quantity"] || row["Quantity"] || "1", 10)
+      || 1,
+    price: row["Lineitem price"] || row["Price"] || row["price"] || "0",
+  };
 }
 
-async function writeOrderGroup(
-  client: ReturnType<typeof getSupabaseClient>,
-  group: OrderGroup,
-) {
-  const { rows, orderId } = group
-  const firstRow = rows[0]
+function splitCodes(value: string): string[] {
+  return [...new Set(
+    sanitizeText(value || "")
+      .split(",")
+      .map((code) => code.trim())
+      .filter(Boolean),
+  )];
+}
 
-  const orderNumber = sanitizeText(firstRow['Name'] || firstRow['name'] || orderId)
-  const email = sanitizeEmail(firstRow['Email'] || firstRow['email'])
+function mapOrder(
+  rows: Record<string, string>[],
+  groupId: string,
+): ImportOrderRecord {
+  const first = rows[0];
+  const sourceId = sanitizeText(
+    first["Order ID"] || first["ID"] || groupId,
+  );
+  if (!sourceId) throw new Error("Order is missing a stable Shopify ID");
 
-  // 建立 shopify_id -> 本地 id 映射（查找一次，复用多次）
-  const customerShopifyMap = new Map<string, string>()
-  const { data: customerData } = await client.from('customers').select('id, shopify_id').not('shopify_id', 'is', null)
-  if (customerData) {
-    for (const c of customerData) {
-      if (c.shopify_id) customerShopifyMap.set(c.shopify_id, c.id)
-    }
+  const orderNumber = sanitizeText(
+    first["Name"] || first["name"] || sourceId,
+  );
+  const lineItems = rows.map(mapLineItem);
+  if (lineItems.some((line) => !line.title)) {
+    throw new Error(`Order ${sourceId} has a line item without a title`);
   }
 
-  const productShopifyMap = new Map<string, string>()
-  const { data: productData } = await client.from('products').select('id, shopify_id').not('shopify_id', 'is', null)
-  if (productData) {
-    for (const p of productData) {
-      if (p.shopify_id) productShopifyMap.set(p.shopify_id, p.id)
-    }
-  }
-
-  const variantShopifyMap = new Map<string, string>()
-  const { data: variantData } = await client.from('product_variants').select('id, shopify_id').not('shopify_id', 'is', null)
-  if (variantData) {
-    for (const v of variantData) {
-      if (v.shopify_id) variantShopifyMap.set(v.shopify_id, v.id)
-    }
-  }
-
-  // 查找客户
-  let customerId: string | null = null
-  const shopifyCustomerId = sanitizeText(firstRow['Customer ID'] || '')
-  if (shopifyCustomerId && customerShopifyMap.has(shopifyCustomerId)) {
-    customerId = customerShopifyMap.get(shopifyCustomerId)!
-  } else if (email) {
-    const { data: existingCustomer } = await client.from('customers').select('id').eq('email', email).maybeSingle()
-    if (existingCustomer) customerId = existingCustomer.id
-  }
-
-  // 地址
-  const shippingAddress = {
-    first_name: sanitizeText(firstRow['Shipping First Name'] || firstRow['shipping_first_name'] || ''),
-    last_name: sanitizeText(firstRow['Shipping Last Name'] || firstRow['shipping_last_name'] || ''),
-    company: sanitizeText(firstRow['Shipping Company'] || ''),
-    address1: sanitizeText(firstRow['Shipping Address1'] || firstRow['shipping_address1'] || ''),
-    address2: sanitizeText(firstRow['Shipping Address2'] || firstRow['shipping_address2'] || ''),
-    city: sanitizeText(firstRow['Shipping City'] || firstRow['shipping_city'] || ''),
-    province: sanitizeText(firstRow['Shipping Province'] || firstRow['shipping_province'] || ''),
-    province_code: sanitizeText(firstRow['Shipping Province Code'] || ''),
-    country: sanitizeText(firstRow['Shipping Country'] || firstRow['shipping_country'] || ''),
-    country_code: sanitizeText(firstRow['Shipping Country Code'] || ''),
-    zip: sanitizeText(firstRow['Shipping Zip'] || firstRow['shipping_zip'] || ''),
-    phone: sanitizeText(firstRow['Shipping Phone'] || ''),
-  }
-
-  const billingAddress = {
-    first_name: sanitizeText(firstRow['Billing First Name'] || firstRow['billing_first_name'] || ''),
-    last_name: sanitizeText(firstRow['Billing Last Name'] || firstRow['billing_last_name'] || ''),
-    company: sanitizeText(firstRow['Billing Company'] || ''),
-    address1: sanitizeText(firstRow['Billing Address1'] || firstRow['billing_address1'] || ''),
-    address2: sanitizeText(firstRow['Billing Address2'] || firstRow['billing_address2'] || ''),
-    city: sanitizeText(firstRow['Billing City'] || firstRow['billing_city'] || ''),
-    province: sanitizeText(firstRow['Billing Province'] || firstRow['billing_province'] || ''),
-    province_code: sanitizeText(firstRow['Billing Province Code'] || ''),
-    country: sanitizeText(firstRow['Billing Country'] || firstRow['billing_country'] || ''),
-    country_code: sanitizeText(firstRow['Billing Country Code'] || ''),
-    zip: sanitizeText(firstRow['Billing Zip'] || firstRow['billing_zip'] || ''),
-    phone: sanitizeText(firstRow['Billing Phone'] || ''),
-  }
-
-  // 创建订单
-  const newOrderId = uuidv4()
-  const { error: orderError } = await client.from('orders').insert({
-    id: newOrderId,
+  return {
+    source_id: sourceId,
     order_number: orderNumber,
-    email,
-    customer_id: customerId,
-    financial_status: sanitizeText(firstRow['Financial Status'] || firstRow['financial_status'] || 'pending'),
-    fulfillment_status: sanitizeText(firstRow['Fulfillment Status'] || firstRow['fulfillment_status'] || 'unfulfilled'),
-    subtotal_price: firstRow['Subtotal'] || firstRow['subtotal_price'] || '0',
-    total_discounts: firstRow['Discount Amount'] || firstRow['total_discounts'] || '0',
-    total_price: firstRow['Total'] || firstRow['total_price'] || '0',
-    total_tax: firstRow['Taxes'] || firstRow['total_tax'] || '0',
-    total_shipping: firstRow['Shipping'] || firstRow['total_shipping'] || '0',
-    currency: sanitizeText(firstRow['Currency'] || firstRow['currency'] || 'USD'),
-    taxes_included: firstRow['Taxes Included'] === 'true' || firstRow['Taxes Included'] === 'Yes',
-    cancel_reason: sanitizeNullableText(firstRow['Cancel Reason']),
-    note: sanitizeText(firstRow['Notes'] || firstRow['note'] || ''),
-    tags: sanitizeText(firstRow['Tags'] || firstRow['tags'] || ''),
-    shipping_address: shippingAddress,
-    billing_address: billingAddress,
-    shopify_id: sanitizeText(orderId),
-    processed_at: firstRow['Processed At'] || firstRow['created_at'] || null,
-    cancelled_at: firstRow['Cancelled At'] || null,
-  })
-  if (orderError) throw new Error(`创建订单失败: ${orderError.message}`)
-
-  // 创建订单明细
-  for (const row of rows) {
-    const shopifyProductId = sanitizeText(row['Product ID'] || row['Lineitem product id'] || '')
-    const shopifyVariantId = sanitizeText(row['Variant ID'] || row['Lineitem variant id'] || '')
-    const productId = productShopifyMap.get(shopifyProductId) || null
-    const variantId = variantShopifyMap.get(shopifyVariantId) || null
-
-    await client.from('order_items').insert({
-      id: uuidv4(),
-      order_id: newOrderId,
-      product_id: productId,
-      variant_id: variantId,
-      title: sanitizeText(row['Lineitem name'] || row['Title'] || row['title'] || ''),
-      variant_title: sanitizeText(row['Lineitem variant'] || row['Variant Title'] || ''),
-      sku: sanitizeNullableText(row['Lineitem sku'] || row['SKU'] || row['sku']),
-      vendor: sanitizeText(row['Lineitem vendor'] || row['Vendor'] || row['vendor'] || ''),
-      quantity: parseInt(row['Lineitem quantity'] || row['Quantity'] || '1', 10) || 1,
-      price: row['Lineitem price'] || row['Price'] || row['price'] || '0',
-      total_discount: row['Lineitem discount'] || '0',
-      requires_shipping: row['Requires Shipping'] !== 'false',
-      taxable: row['Taxable'] !== 'false',
-      shopify_id: sanitizeText(row['Lineitem id'] || ''),
-      shopify_product_id: shopifyProductId,
-      shopify_variant_id: shopifyVariantId,
-    })
-  }
+    customer_source_id: sanitizeNullableText(first["Customer ID"]),
+    email: sanitizeEmail(first["Email"] || first["email"]) || null,
+    financial_status: sanitizeNullableText(
+      first["Financial Status"] || first["financial_status"],
+    ) || "pending",
+    fulfillment_status: sanitizeNullableText(
+      first["Fulfillment Status"] || first["fulfillment_status"],
+    ) || "unfulfilled",
+    currency: sanitizeNullableText(first["Currency"] || first["currency"])
+      || "USD",
+    total_price: first["Total"] || first["total_price"] || "0",
+    subtotal_price:
+      first["Subtotal"] || first["subtotal_price"] || null,
+    shipping_price:
+      first["Shipping"] || first["total_shipping"] || null,
+    tax_price: first["Taxes"] || first["total_tax"] || null,
+    discount_codes: splitCodes(
+      first["Discount Code"] || first["Discount Codes"] || "",
+    ),
+    discount_amount:
+      first["Discount Amount"] || first["total_discounts"] || null,
+    billing_address: cleanAddress(first, "Billing"),
+    shipping_address: cleanAddress(first, "Shipping"),
+    line_items: lineItems,
+    created_at:
+      first["Processed At"]
+      || first["Created at"]
+      || first["created_at"]
+      || null,
+    note: sanitizeNullableText(first["Notes"] || first["note"]),
+  };
 }
 
-/** 从 CSV 导入订单 */
 export async function importOrders(file: File): Promise<ImportResult> {
-  return importGroupedCsv(
-    file,
-    'orders',
-    groupKey,
-    mapGroup,
-    writeOrderGroup,
-  )
+  const rows = await parseCsvRows(file);
+  const groups = groupRows(rows, orderGroupKey);
+  const records = groups.map(([id, group]) => mapOrder(group, id));
+
+  const { sessionId, result } = await importEnvelope("orders", records);
+  setRunningProgress(sessionId, "orders", records.length);
+  return finishProgress(sessionId, "orders", result);
 }

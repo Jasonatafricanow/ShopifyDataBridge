@@ -2,13 +2,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ getUser: vi.fn(), client: vi.fn() }));
 vi.mock("@/storage/database/supabase-client", () => ({ getSupabaseClient: mocks.client }));
 import { requireUser, errorResponse, AuthError } from "@/services/auth/auth-middleware";
-beforeEach(() => { vi.clearAllMocks(); mocks.client.mockReturnValue({ auth: { getUser: mocks.getUser } }); });
+beforeEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); mocks.client.mockReturnValue({ auth: { getUser: mocks.getUser } }); });
 describe("production authentication middleware", () => {
   it.each([undefined, "", "Basic token"])("rejects an absent or invalid header %s before provider access", async header => {
     await expect(requireUser(new Request("https://app.test", { headers: header ? { authorization: header } : {} }))).rejects.toBeInstanceOf(AuthError);
     expect(mocks.client).not.toHaveBeenCalled();
   });
   it("passes the actual bearer to Supabase and uses its verified identity", async () => {
+    vi.stubEnv("MIGRATION_ADMIN_EMAILS", "buyer@example.com");
     mocks.getUser.mockResolvedValue({ data: { user: { id: "verified", email: "buyer@example.com" } }, error: null });
     await expect(requireUser(new Request("https://app.test", { headers: { authorization: "Bearer token" } }))).resolves.toEqual({ id: "verified", email: "buyer@example.com" });
     expect(mocks.client).toHaveBeenCalledWith("token"); expect(mocks.getUser).toHaveBeenCalledWith("token");
